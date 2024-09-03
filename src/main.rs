@@ -5,82 +5,80 @@ use influxdb::{Client, InfluxDbWriteable};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::io::{self, BufRead};
-use std::time::SystemTime;
 use std::time::Duration;
+use std::time::SystemTime;
 
-// {"message_type":"status","seconds_elapsed":34,"percent_done":1.0000004500042092,"total_files":118816,"files_done":118816,"total_bytes":125958821830,"bytes_done":125958878512}
+fn deserialize_current_files<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s: Option<Vec<String>> = Option::deserialize(deserializer)?;
+    match s {
+        Some(v) => Ok(v.join(",")),
+        None => Ok(String::new()),
+    }
+}
 
-#[derive(InfluxDbWriteable, Debug)]
-struct StatusMessageOut {
+// Sometimes some fields aren't present.
+// time is added after deserialization and is mandatoring for InfluxDbWriteable
+// file list are deserialized into a comma-separated list
+#[derive(InfluxDbWriteable, Debug, Deserialize)]
+struct StatusMessage {
+    #[serde(default)]
     time: DateTime<Utc>,
     message_type: String,
     seconds_elapsed: u64,
+    #[serde(default)]
     seconds_remaining: u64,
     percent_done: f64,
-    total_files: u64,
+    #[serde(default)]
     files_done: u64,
-    total_bytes: u64,
+    total_files: u64,
+    #[serde(default)]
     bytes_done: u64,
+    total_bytes: u64,
+    #[serde(default)]
     error_count: u64,
-    // current_files: String,
+    #[serde(deserialize_with = "deserialize_current_files", default)]
+    current_files: String,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-struct StatusMessage {
+#[derive(InfluxDbWriteable, Debug, Deserialize)]
+struct ErrorMessage {
+    #[serde(default)]
+    time: DateTime<Utc>,
     message_type: String,
-    seconds_elapsed: u64,
-    seconds_remaining: Option<u64>,
-    percent_done: f64,
-    total_files: u64,
-    files_done: u64,
-    total_bytes: u64,
-    bytes_done: u64,
-    error_count: Option<u64>,
-    current_files: Option<Vec<String>>,
+    during: String,
+    item: String,
 }
 
-// {"message_type":"summary","files_new":4,"files_changed":10,"files_unmodified":2331042,"dirs_new":0,"dirs_changed":15,"dirs_unmodified":888795,"data_blobs":28,"tree_blobs":14,"data_added":27699291,"total_files_processed":2331056,"total_bytes_processed":2306593302132,"total_duration":555.877498816,"snapshot_id":"59717ddd45f793c52138cff2edef7b250e6f978a73883b5acd3dd36851da5f7a"}
-
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, InfluxDbWriteable)]
 struct SummaryMessage {
-  message_type: String,
-  files_new: u64,
-  files_changed: u64,
-  files_unmodified: u64,
-  dirs_new: u64,
-  dirs_changed: u64,
-  dirs_unmodified: u64,
-  data_blobs: u64,
-  tree_blobs: u64,
-  data_added: u64,
-  total_files_processed: u64,
-  total_bytes_processed: u64,
-  total_duration: f64,
-  snapshot_id: String
-}
-
-#[derive(InfluxDbWriteable, Debug)]
-struct SummaryMessageOut {
-  time: DateTime<Utc>,
-  message_type: String,
-  files_new: u64,
-  files_changed: u64,
-  files_unmodified: u64,
-  dirs_new: u64,
-  dirs_changed: u64,
-  dirs_unmodified: u64,
-  data_blobs: u64,
-  tree_blobs: u64,
-  data_added: u64,
-  total_files_processed: u64,
-  total_bytes_processed: u64,
-  total_duration: f64,
-  snapshot_id: String
+    #[serde(default)]
+    time: DateTime<Utc>,
+    message_type: String,
+    data_added: u64,
+    data_blobs: u64,
+    dirs_changed: u64,
+    dirs_new: u64,
+    dirs_unmodified: u64,
+    files_changed: u64,
+    files_new: u64,
+    files_unmodified: u64,
+    snapshot_id: String,
+    total_bytes_processed: u64,
+    total_duration: f64,
+    total_files_processed: u64,
+    tree_blobs: u64,
 }
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
+    /// Enable dry-run mode: don't write to influxdb
+    #[arg(long, default_value_t = false)]
+    dry_run: bool,
+
     /// Enable verbose mode
     #[arg(short, long, default_value_t = false)]
     verbose: bool,
@@ -113,7 +111,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let client = Client::new(cli.host, cli.database).with_auth(cli.user, cli.password);
 
-    let mut print_time = Utc::now() - Duration::from_secs(cli.interval);
+    // Always write the first item
+    let mut last_write_time = Utc::now() - Duration::from_secs(cli.interval) * 2;
 
     for line in stdin.lock().lines() {
         let line = line.unwrap();
@@ -129,67 +128,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap()
             .to_string();
 
-        if type_ == "status" {
-            // very spammy, limit database writes
-            if Utc::now() < print_time + Duration::from_secs(cli.interval) {
+        let query = match type_.as_str() {
+            "status" => {
+                // very spammy, limit database writes
+                if Utc::now() < last_write_time + Duration::from_secs(cli.interval) {
+                    continue;
+                }
+                last_write_time = Utc::now();
+                let mut status: StatusMessage = match serde_json::from_str(&line) {
+                    Ok(message) => message,
+                    Err(e) => {
+                        eprintln!("Status parse error: {:?}", e);
+                        continue;
+                    }
+                };
+
+                status.time = SystemTime::now().into();
+                status.into_query("status_message")
+            }
+            "summary" => {
+                let mut summary: SummaryMessage = match serde_json::from_str(&line) {
+                    Ok(message) => message,
+                    Err(e) => {
+                        eprintln!("Summary parse error: {:?}", e);
+                        continue;
+                    }
+                };
+
+                summary.time = SystemTime::now().into();
+                summary.into_query("summary_message")
+            }
+            "error" => {
+                let mut error: ErrorMessage = match serde_json::from_str(&line) {
+                    Ok(message) => message,
+                    Err(e) => {
+                        eprintln!("Error parse error: {:?}", e);
+                        continue;
+                    }
+                };
+                error.time = SystemTime::now().into();
+                error.into_query("error_message")
+            }
+            _ => {
                 continue;
             }
-            print_time = Utc::now();
-            let status: StatusMessage = match serde_json::from_str(&line) {
-                Ok(message) => message,
-                Err(_) => {
-                    panic!("Parse error");
-                }
-            };
-            let data = StatusMessageOut {
-                time: SystemTime::now().into(),
-                message_type: status.message_type,
-                seconds_elapsed: status.seconds_elapsed,
-                seconds_remaining: status.seconds_remaining.unwrap_or(0),
-                percent_done: status.percent_done,
-                total_files: status.total_files,
-                files_done: status.files_done,
-                total_bytes: status.total_bytes,
-                bytes_done: status.bytes_done,
-                error_count: status.error_count.unwrap_or(0),
-            };
+        };
 
-            println!("-> {:?}", data);
-
-            let query = data.into_query("status_message");
+        if cli.dry_run {
+            println!("-> {:?}", query);
+        } else {
             client.query(&query).await?;
-        } else if type_ == "summary" {
-            let summary: SummaryMessage = match serde_json::from_str(&line) {
-                Ok(message) => message,
-                Err(_) => {
-                    panic!("Parse error");
-                }
-            };
-
-            println!("-> {:?}", summary);
-
-            let out = SummaryMessageOut {
-              time: SystemTime::now().into(),
-              message_type: summary.message_type,
-              files_new: summary.files_new,
-              files_changed: summary.files_changed,
-              files_unmodified: summary.files_unmodified,
-              dirs_new: summary.dirs_new,
-              dirs_changed: summary.dirs_changed,
-              dirs_unmodified: summary.dirs_unmodified,
-              data_blobs: summary.data_blobs,
-              tree_blobs: summary.tree_blobs,
-              data_added: summary.data_added,
-              total_files_processed: summary.total_files_processed,
-              total_bytes_processed: summary.total_bytes_processed,
-              total_duration: summary.total_duration,
-              snapshot_id: summary.snapshot_id
-            };
-
-            let query = out.into_query("summary_message");
-            client.query(&query).await?;
-        } else if type_ == "error" {
-            // ... handle error message
         }
     }
 
