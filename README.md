@@ -4,7 +4,7 @@
 
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-informational?style=flat-square)](COPYRIGHT.md)
 
-Feed `restic` backup data into `influxdb`.
+Feed `restic` backup data into InfluxDB and/or a Prometheus node-exporter textfile.
 
 # Usage
 
@@ -12,8 +12,16 @@ Feed `restic` backup data into `influxdb`.
 ./restic backup ... --json | ./restic-to-influxdb --user ... --password ... --database ... --host http://localhost:8086
 ```
 
+For Prometheus, point the converter at a directory mounted into node-exporter's
+textfile collector. The file is replaced atomically so Prometheus never sees a
+partially written scrape:
+
 ```
-Usage: restic-to-influxdb [OPTIONS] --user <USER> --password <PASSWORD> --database <DATABASE>
+./restic backup ... --json | ./restic-to-influxdb --prometheus-file /var/lib/node-exporter/textfile/restic_backup.prom
+```
+
+```
+Usage: restic-to-influxdb [OPTIONS]
 
 Options:
       --dry-run              Enable dry-run mode: don't write to influxdb
@@ -23,6 +31,8 @@ Options:
   -p, --password <PASSWORD>  InfluxDB password
   -d, --database <DATABASE>  InfluxDB database
       --host <HOST>          InfluxDB host [default: http://localhost:8086]
+      --prometheus-file <PROMETHEUS_FILE>
+                             Atomically write Prometheus textfile-collector metrics here
   -h, --help                 Print help
   -V, --version              Print version
 ```
