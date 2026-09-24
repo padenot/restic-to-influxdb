@@ -118,7 +118,10 @@ fn render_prometheus(
     let mut lines = vec![
         "# HELP restic_backup_running Whether a restic backup is currently running.".to_string(),
         "# TYPE restic_backup_running gauge".to_string(),
-        format!("restic_backup_running {}", u8::from(summary.is_none())),
+        format!(
+            "restic_backup_running {}",
+            u8::from(status.is_some() && summary.is_none())
+        ),
         "# HELP restic_backup_success Whether the latest completed backup succeeded.".to_string(),
         "# TYPE restic_backup_success gauge".to_string(),
         format!("restic_backup_success {}", u8::from(success)),
@@ -192,6 +195,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Always write the first item
     let mut last_write_time = Utc::now() - Duration::from_secs(cli.interval) * 2;
+    let mut saw_summary = false;
 
     for line in stdin.lock().lines() {
         let line = line.unwrap();
@@ -231,6 +235,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 status.into_query("status_message")
             }
             "summary" => {
+                saw_summary = true;
                 let mut summary: SummaryMessage = match serde_json::from_str(&line) {
                     Ok(message) => message,
                     Err(e) => {
@@ -270,6 +275,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    if let Some(path) = &cli.prometheus_file {
+        if !saw_summary {
+            let rendered = render_prometheus(None, None, false, Utc::now().timestamp());
+            write_prometheus_file(path, &rendered)?;
+        }
+    }
+
     Ok(())
 }
 
@@ -299,6 +311,14 @@ mod tests {
         assert!(rendered.contains("restic_backup_percent_done 25"));
         assert!(rendered.contains("restic_backup_files_done 5"));
         assert!(rendered.contains("restic_backup_last_update_timestamp_seconds 1700000000"));
+    }
+
+    #[test]
+    fn renders_incomplete_run_as_stopped_failure() {
+        let rendered = render_prometheus(None, None, false, 1_700_000_002);
+
+        assert!(rendered.contains("restic_backup_running 0"));
+        assert!(rendered.contains("restic_backup_success 0"));
     }
 
     #[test]
